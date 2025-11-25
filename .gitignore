@@ -1,0 +1,79 @@
+# 忽略模型文件、视频、数据集、缓存文件、日志文件
+
+# Python 缓存文件
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# 虚拟环境
+venv/
+env/
+ENV/
+.venv
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# 模型文件
+models/
+*.pth
+*.pt
+*.ckpt
+*.h5
+*.pb
+*.onnx
+checkpoints/
+
+# 数据集
+data/
+dataset/
+datasets/
+*.tfrecord
+*.json
+*.png
+*.jpg
+*.jpeg
+
+# 视频和图片输出
+plots/
+outputs/
+results/
+*.mp4
+*.avi
+*.gif
+*.mkv
+
+# 日志文件
+logs/
+*.log
+runs/
+wandb/
+tensorboard/
+
+# IDE 配置
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
+*.bak
+
+# 编译文件
+*.o
+*.a
+*.lib
+*.dll
+*.dylib
+
+# 其他
+*.egg-info/
+dist/
+build/
+*.whl
