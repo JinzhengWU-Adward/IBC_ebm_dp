@@ -101,7 +101,9 @@ class ParticleDataset(Dataset):
                             obs_seq.append(obs)
                     
                     if len(obs_seq) == self.obs_seq_len:
-                        action = actions[i]  # 当前步的动作
+                        # 标签使用窗口最后一步的动作，匹配 IBC 中 action[:, -1]
+                        action_idx = i + self.obs_seq_len - 1
+                        action = actions[action_idx]  # 窗口末尾对应的动作
                         
                         self.episodes.append({
                             'obs_seq': np.array(obs_seq, dtype=np.float32),
@@ -383,8 +385,15 @@ def train_particle_ebm(
     )
     
     # 创建 ULA 采样器（用于生成负样本）
-    # 动作范围：归一化后的 [-1, 1]
-    action_bounds = np.array([[-1.0, -1.0], [1.0, 1.0]])  # (2, action_dim)
+    # 动作范围：在归一化空间 [-1, 1] 的基础上做 uniform_boundary_buffer 外扩
+    # 对齐 gin 中的: train_eval.uniform_boundary_buffer = 0.05
+    uniform_boundary_buffer = 0.05
+    # 归一化动作的理论范围为 [-1, 1]，外扩后的范围为 [-1 - 0.1, 1 + 0.1] = [-1.1, 1.1]
+    norm_min, norm_max = -1.0, 1.0
+    expanded_min = norm_min - uniform_boundary_buffer * (norm_max - norm_min) * 2.0
+    expanded_max = norm_max + uniform_boundary_buffer * (norm_max - norm_min) * 2.0
+    action_bounds = np.array([[expanded_min, expanded_min],
+                              [expanded_max, expanded_max]], dtype=np.float32)  # (2, action_dim)
     ula_sampler = ULASampler(
         bounds=action_bounds,
         step_size=ula_step_size,
@@ -438,14 +447,13 @@ def train_particle_ebm(
             energy_positives = model(obs_seq, actions_expanded)  # (B, 1)
             
             # 生成负样本（使用 ULA）
-            # 初始化：从均匀分布采样
-            # 注意：IBC 使用 uniform_boundary_buffer=0.05 来扩展采样范围
-            # 这里暂时使用 [-1, 1] (归一化后的范围)
-            # TODO: 实现 uniform_boundary_buffer 逻辑
+            # 初始化：从均匀分布采样（使用带 uniform_boundary_buffer 的外扩范围）
+            neg_min = float(action_bounds[0, 0])
+            neg_max = float(action_bounds[1, 0])
             init_negatives = torch.rand(
                 B, num_counter_examples, action_dim,
                 device=device
-            ) * 2.0 - 1.0  # 范围 [-1, 1]
+            ) * (neg_max - neg_min) + neg_min  # 范围 [expanded_min, expanded_max]
             
             # ULA 采样
             negatives, _ = ula_sampler.sample(
@@ -555,7 +563,7 @@ def train_particle_ebm(
                     eval_init_negatives = torch.rand(
                         eval_B, num_counter_examples, action_dim,
                         device=device
-                    ) * 2.0 - 1.0
+                    ) * (neg_max - neg_min) + neg_min
                     
                     # ULA 采样（需要梯度）
                     with torch.enable_grad():
