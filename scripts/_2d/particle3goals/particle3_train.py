@@ -66,10 +66,19 @@ class ParticleDataset(Dataset):
             actions = np.array(data['actions'], dtype=np.float32)
             first_goal = np.array(data['first_goal_position'], dtype=np.float32)
             second_goal = np.array(data['second_goal_position'], dtype=np.float32)
+            # 第三个目标：优先从 JSON 中读取 third_goal_position，
+            # 若不存在则回退为 second_goal（兼容旧数据）
+            third_goal_key = 'third_goal_position'
+            if third_goal_key in data:
+                third_goal = np.array(data[third_goal_key], dtype=np.float32)
+            else:
+                third_goal = second_goal.copy()
             
-            # 构建观测：对于 Particle 环境，观测包含 pos_agent, vel_agent, pos_first_goal, pos_second_goal
-            # 根据 IBC 的实现，观测会被展平为 [pos_agent, vel_agent, pos_first_goal, pos_second_goal]
-            # 维度：2 + 2 + 2 + 2 = 8 (hide_velocity=False 是默认值)
+            # 构建观测：对于 3-goals Particle 环境，观测包含
+            #   pos_agent, vel_agent, pos_first_goal, pos_second_goal, pos_third_goal
+            # 展平后顺序为:
+            #   [pos_agent(2), vel_agent(2), first_goal(2), second_goal(2), third_goal(2)]
+            # 维度：2 + 2 + 2 + 2 + 2 = 10 (hide_velocity=False)
             
             # 直接从 JSON 读取速度（如果可用），否则通过差分计算
             if 'velocities' in data['trajectory']:
@@ -84,21 +93,20 @@ class ParticleDataset(Dataset):
                     # 第一个速度设为 0（匹配 IBC 环境重置行为）
                     velocities[0] = np.zeros_like(positions[0])
             
-            # ===== 先添加首帧重复的样本：[x1, x1] -> a1 =====
+            # ===== 先添加首帧重复的样本：[x1, x1, ..., x1] -> a1 =====
             if len(positions) >= self.obs_seq_len:
-                # 构建首帧观测（原始空间）
                 first_obs = np.concatenate([
-                    positions[0],       # pos_agent (2D)
-                    velocities[0],      # vel_agent (2D)
-                    first_goal,         # pos_first_goal (2D)
-                    second_goal         # pos_second_goal (2D)
+                    positions[0],   # pos_agent (2D)
+                    velocities[0],  # vel_agent (2D)
+                    first_goal,     # pos_first_goal (2D)
+                    second_goal,    # pos_second_goal (2D)
+                    third_goal      # pos_third_goal (2D)
                 ])
-                # 将首帧重复 obs_seq_len 次，模拟 HistoryWrapper(tile_first_step_obs=True)
                 first_obs_seq = np.stack(
                     [first_obs for _ in range(self.obs_seq_len)],
                     axis=0
                 )  # (obs_seq_len, obs_dim)
-                first_action = actions[0]  # 对应 a1
+                first_action = actions[0]
 
                 self.episodes.append({
                     'obs_seq': first_obs_seq.astype(np.float32),
@@ -116,12 +124,13 @@ class ParticleDataset(Dataset):
                     for j in range(self.obs_seq_len):
                         idx = i + j
                         if idx < len(positions):
-                            # 观测：pos_agent, vel_agent, pos_first_goal, pos_second_goal
+                            # 观测：pos_agent, vel_agent, pos_first_goal, pos_second_goal, pos_third_goal
                             obs = np.concatenate([
                                 positions[idx],  # pos_agent (2D)
                                 velocities[idx], # vel_agent (2D)
                                 first_goal,      # pos_first_goal (2D)
-                                second_goal      # pos_second_goal (2D)
+                                second_goal,     # pos_second_goal (2D)
+                                third_goal       # pos_third_goal (2D)
                             ])
                             obs_seq.append(obs)
                     
@@ -648,10 +657,10 @@ if __name__ == '__main__':
     
     parser = argparse.ArgumentParser(description='训练 Particle EBM 模型')
     parser.add_argument('--data_dir', type=str, 
-                       default=str(IBC_ROOT / 'data' / '_2d' / 'particle'),
+                       default=str(IBC_ROOT / 'data' / '_2d' / 'particle3goals'),
                        help='数据目录')
     parser.add_argument('--output_dir', type=str,
-                       default=str(IBC_ROOT / 'models' / '_2d' / 'particle'),
+                       default=str(IBC_ROOT / 'models' / '_2d' / 'particle3goals'),
                        help='输出目录')
     parser.add_argument('--device', type=str, default=None,
                        help='计算设备 (cuda/cpu)')
