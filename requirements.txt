@@ -1,0 +1,51 @@
+# IBC_ebm_dp 项目依赖项
+# PyTorch 实现的 IBC (Implicit Behavioral Cloning) 能量模型
+
+# ===== 核心依赖 =====
+# PyTorch（根据 CUDA 版本选择，这里提供 CPU 版本作为基础）
+# 如果需要 GPU 支持，请访问 https://pytorch.org/get-started/locally/ 安装对应版本
+torch>=1.9.0,<2.0.0
+torchvision>=0.10.0,<0.15.0  # 用于图像处理（如果需要）
+torchaudio>=0.9.0,<0.15.0    # 用于音频处理（如果需要）
+
+# 数据处理
+numpy>=1.19.0,<2.0.0
+Pillow>=8.0.0,<11.0.0  # PIL 图像处理
+
+# 可视化
+matplotlib>=3.3.0,<4.0.0
+
+# 工具库
+tqdm>=4.60.0,<5.0.0
+
+# ===== 可选依赖（用于数据生成） =====
+# 如果需要使用 IBC 环境生成数据，需要安装以下依赖：
+# 注意：这些依赖来自 IBC 项目，用于数据生成脚本
+# 如果只进行训练和测试，可以跳过这些依赖
+
+# gin-config>=0.4.0  # 用于配置管理（数据生成脚本需要）
+# tensorflow>=2.6.0,<2.7.0  # IBC 环境需要 TensorFlow
+# tf-agents>=0.11.0rc0  # TensorFlow Agents（IBC 环境需要）
+# gym>=0.21.0,<0.22.0  # OpenAI Gym（IBC 环境需要）
+# absl-py>=0.12.0  # Google Abseil（IBC 需要）
+
+# ===== 系统依赖（非 Python 包） =====
+# 如果使用 matplotlib.animation.FFMpegWriter 生成视频，需要安装：
+# - ffmpeg (系统级依赖)
+#   安装方法：
+#   Ubuntu/Debian: sudo apt-get install ffmpeg
+#   macOS: brew install ffmpeg
+#   Windows: 从 https://ffmpeg.org/download.html 下载
+
+# ===== 安装说明 =====
+# 1. 基础安装（仅训练和测试）：
+#    pip install -r requirements.txt
+#
+# 2. 完整安装（包括数据生成功能）：
+#    首先安装 IBC 项目的依赖（参考 ../ibc/requirements.txt）
+#    然后取消上面可选依赖的注释并安装
+#
+# 3. GPU 支持：
+#    访问 https://pytorch.org/get-started/locally/ 获取适合您系统的 PyTorch GPU 版本
+#    例如：pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+

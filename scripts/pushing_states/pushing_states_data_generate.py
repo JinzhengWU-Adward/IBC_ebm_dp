@@ -39,7 +39,7 @@ if str(IBC_PARENT_DIR) not in sys.path:
     sys.path.insert(0, str(IBC_PARENT_DIR))
 
 # 兼容 gym / tf-agents 的 patch（需在 tf-agents 之前 import）
-from ibc.utils import gym_compat  # noqa: F401
+from ibc.ibc.utils import gym_compat  # noqa: F401
 
 from tf_agents.environments import suite_gym
 
@@ -272,7 +272,7 @@ def generate_pushing_dataset(
 if __name__ == "__main__":
     # 默认输出到 IBC_ebm_dp/data/pushing_states/
     default_output_dir = (
-        Path(__file__).parent.parent.parent.parent / "data" / "pushing_states"
+        Path(__file__).parent.parent.parent / "data" / "pushing_states"
     )
     os.makedirs(default_output_dir, exist_ok=True)
 

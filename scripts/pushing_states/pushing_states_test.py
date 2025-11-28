@@ -1,0 +1,740 @@
+"""
+Block Pushing (states) 环境 EBM 模型测试脚本
+在 pybullet 环境中加载训练好的模型并进行评估
+复现 IBC 的 run_mlp_ebm_langevin.sh 评估场景
+"""
+import numpy as np
+import json
+from pathlib import Path
+import torch
+import torch.nn as nn
+import sys
+from tqdm import tqdm
+import copy
+import os
+from datetime import datetime
+import time
+try:
+    import cv2
+    HAS_CV2 = True
+except ImportError:
+    HAS_CV2 = False
+    print("警告: 未安装 opencv-python，无法保存视频。请运行: pip install opencv-python")
+
+# 添加项目路径
+IBC_ROOT = Path(__file__).parent.parent.parent  # IBC_ebm_dp
+sys.path.insert(0, str(IBC_ROOT))
+
+from core.models import SequenceEBM
+from core.optimizers import ULASampler
+
+# 添加 IBC 路径以便导入环境
+IBC_PARENT_DIR = Path(__file__).parent.parent.parent.parent
+if str(IBC_PARENT_DIR) not in sys.path:
+    sys.path.insert(0, str(IBC_PARENT_DIR))
+
+# 兼容 gym / tf-agents 的 patch（需在 tf-agents 之前 import）
+from ibc.ibc.utils import gym_compat  # noqa: F401
+
+from tf_agents.environments import suite_gym
+from tf_agents.environments import wrappers
+from tf_agents.trajectories import time_step as ts
+
+from ibc.environments.block_pushing import block_pushing
+
+# 导入训练脚本中的工具函数
+sys.path.insert(0, str(Path(__file__).parent))
+from pushing_states_train import flatten_observation
+
+
+def load_model(model_path, device='cuda' if torch.cuda.is_available() else 'cpu'):
+    """
+    加载训练好的 SequenceEBM 模型
+    
+    Args:
+        model_path: 模型文件路径
+        device: 计算设备
+    
+    Returns:
+        model: 加载的模型
+        checkpoint: 模型 checkpoint 信息
+        norm_params: 归一化参数
+    """
+    print(f"加载模型从: {model_path}")
+    checkpoint = torch.load(model_path, map_location=device)
+    
+    # 获取模型参数
+    obs_dim = checkpoint.get('obs_dim', 10)
+    action_dim = checkpoint.get('action_dim', 2)
+    obs_seq_len = checkpoint.get('obs_seq_len', 2)
+    hidden_dim = checkpoint.get('hidden_dim', 128)
+    num_residual_blocks = checkpoint.get('num_residual_blocks', 8)
+    dropout = checkpoint.get('dropout', 0.0)
+    norm_type = checkpoint.get('norm_type', None)
+    norm_params = checkpoint.get('norm_params', None)
+    
+    print(f"模型参数:")
+    print(f"  obs_dim={obs_dim}, action_dim={action_dim}, obs_seq_len={obs_seq_len}")
+    print(f"  hidden_dim={hidden_dim}, num_residual_blocks={num_residual_blocks}")
+    print(f"  dropout={dropout}, norm_type={norm_type}")
+    
+    # 创建 SequenceEBM
+    model = SequenceEBM(
+        obs_dim=obs_dim,
+        action_dim=action_dim,
+        obs_seq_len=obs_seq_len,
+        hidden_dim=hidden_dim,
+        num_residual_blocks=num_residual_blocks,
+        dropout=dropout,
+        norm_type=norm_type
+    )
+    
+    # 加载模型权重
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model = model.to(device)
+    model.eval()
+    
+    print("模型加载完成！")
+    return model, checkpoint, norm_params
+
+
+def denormalize_action(action_norm, norm_params):
+    """
+    将归一化的动作反归一化到原始空间
+    
+    Args:
+        action_norm: 归一化动作 (2,)，范围 [-1, 1]
+        norm_params: 归一化参数字典
+    
+    Returns:
+        action_orig: 原始动作 (2,)
+    """
+    if norm_params is None or norm_params.get('action_min') is None:
+        return action_norm
+    
+    action_min = np.array(norm_params['action_min'])
+    action_max = np.array(norm_params['action_max'])
+    action_range = action_max - action_min
+    
+    # 从 [-1, 1] 反归一化到原始范围
+    action_orig = (action_norm + 1.0) / 2.0 * action_range + action_min
+    return action_orig
+
+
+def normalize_observation(obs_dict, norm_params):
+    """
+    将观测字典归一化
+    
+    Args:
+        obs_dict: 观测字典（可能已经被 HistoryWrapper 堆叠）
+        norm_params: 归一化参数
+    
+    Returns:
+        obs_norm: 归一化后的观测向量 (10,)
+    """
+    # 检查观测是否已被 HistoryWrapper 堆叠
+    # 如果堆叠，每个字段的形状是 (history_length, ...)
+    # 我们需要取最后一个时间步的观测
+    obs_dict_current = {}
+    for key, value in obs_dict.items():
+        value = np.array(value)
+        if value.ndim > 1:
+            # 已被堆叠，取最后一个时间步
+            obs_dict_current[key] = value[-1]
+        else:
+            # 单个观测
+            obs_dict_current[key] = value
+    
+    # 展平观测
+    obs_flat = flatten_observation(obs_dict_current)
+    
+    if norm_params is None or norm_params.get('obs_mean') is None:
+        return obs_flat
+    
+    obs_mean = np.array(norm_params['obs_mean'])
+    obs_std = np.array(norm_params['obs_std'])
+    
+    obs_norm = (obs_flat - obs_mean) / obs_std
+    return obs_norm
+
+
+def infer_action(
+    model: SequenceEBM,
+    obs_seq: torch.Tensor,
+    ula_sampler: ULASampler,
+    num_action_samples: int = 512,
+    device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
+):
+    """
+    使用 ULA 推理下一个动作（在归一化空间）
+    
+    Args:
+        model: 训练好的 SequenceEBM 模型
+        obs_seq: observation 序列（归一化），形状为 (1, obs_seq_len, obs_dim)
+        ula_sampler: ULASampler 实例
+        num_action_samples: 采样候选数量
+        device: 计算设备
+    
+    Returns:
+        next_action: 预测的动作（归一化空间），形状为 (2,)
+    """
+    model.eval()
+    
+    # 初始化候选动作（归一化空间 [-1, 1]）
+    uniform_boundary_buffer = 0.05
+    norm_min, norm_max = -1.0, 1.0
+    expanded_min = norm_min - uniform_boundary_buffer * (norm_max - norm_min) * 2.0
+    expanded_max = norm_max + uniform_boundary_buffer * (norm_max - norm_min) * 2.0
+    
+    init_candidates = torch.rand(
+        1, num_action_samples, 2,
+        device=device
+    ) * (expanded_max - expanded_min) + expanded_min
+    
+    # ULA 采样
+    with torch.enable_grad():
+        candidates, _ = ula_sampler.sample(
+            x=obs_seq,
+            ebm=model,
+            num_samples=num_action_samples,
+            init_samples=init_candidates,
+            return_trajectory=False
+        )
+    
+    # 计算能量并选择最优动作
+    with torch.no_grad():
+        energies = model(obs_seq, candidates)  # (1, num_action_samples)
+        best_idx = energies.argmin(dim=1)  # (1,)
+        next_action = candidates[0, best_idx[0]]  # (2,)
+    
+    return next_action.cpu().numpy()
+
+
+def evaluate_policy(
+    model: SequenceEBM,
+    norm_params: dict,
+    num_episodes: int = 20,
+    max_steps: int = 100,
+    num_action_samples: int = 512,
+    device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
+    shared_memory: bool = False,
+    seed: int = None,
+    save_video: bool = False,
+    video_output_dir: str = None,
+    video_episodes: int = 1  # 保存前 N 个 episodes 的视频
+):
+    """
+    在 pybullet BlockPush 环境中评估策略
+    
+    Args:
+        model: 训练好的 SequenceEBM 模型
+        norm_params: 归一化参数
+        num_episodes: 评估的 episode 数量
+        max_steps: 每个 episode 的最大步数
+        num_action_samples: ULA 采样候选数量
+        device: 计算设备
+        shared_memory: 是否使用共享内存（用于可视化）
+        seed: 随机种子
+    
+    Returns:
+        results: 评估结果字典
+    """
+    print("=" * 60)
+    print("在 pybullet BlockPush 环境中评估策略")
+    print("=" * 60)
+    print(f"Episode 数量: {num_episodes}")
+    print(f"最大步数: {max_steps}")
+    print(f"设备: {device}")
+    print()
+    
+    # 创建环境
+    env_name = block_pushing.build_env_name(
+        task="PUSH", 
+        shared_memory=shared_memory, 
+        use_image_obs=False
+    )
+    env = suite_gym.load(env_name)
+    
+    # 添加 HistoryWrapper（匹配训练时的配置）
+    history_length = norm_params.get('obs_seq_len', 2)
+    env = wrappers.HistoryWrapper(
+        env, 
+        history_length=history_length, 
+        tile_first_step_obs=True
+    )
+    
+    # 创建 ULA 采样器
+    uniform_boundary_buffer = 0.05
+    norm_min, norm_max = -1.0, 1.0
+    expanded_min = norm_min - uniform_boundary_buffer * (norm_max - norm_min) * 2.0
+    expanded_max = norm_max + uniform_boundary_buffer * (norm_max - norm_min) * 2.0
+    action_bounds = np.array([[expanded_min, expanded_min],
+                              [expanded_max, expanded_max]], dtype=np.float32)
+    
+    ula_sampler = ULASampler(
+        bounds=action_bounds,
+        step_size=0.2,
+        num_steps=1,
+        noise_scale=1.0,
+        step_size_final=1e-5,
+        step_size_power=2.0,
+        delta_action_clip=0.1,
+        device=device
+    )
+    
+    # 评估指标
+    successes = []
+    final_goal_distances = []
+    episode_lengths = []
+    
+    # 频率统计
+    inference_times = []  # 推理时间列表
+    execution_times = []  # 执行（IK + step）时间列表
+    total_inference_time = 0.0
+    total_execution_time = 0.0
+    total_steps = 0
+    
+    # 视频保存相关
+    video_writers = []
+    if save_video and HAS_CV2:
+        video_output_dir = Path(video_output_dir)
+        video_output_dir.mkdir(parents=True, exist_ok=True)
+        print(f"视频将保存到: {video_output_dir}")
+    
+    print("开始评估...")
+    for ep_idx in tqdm(range(num_episodes), desc="评估进度"):
+        # 重置环境
+        time_step = env.reset()
+        
+        # 初始化视频写入器（如果需要）
+        video_writer = None
+        video_frames = []
+        video_path = None
+        if save_video and HAS_CV2 and ep_idx < video_episodes:
+            # 视频文件保存在 video_output_dir 目录下
+            video_path = video_output_dir / f'episode_{ep_idx:03d}.mp4'
+            # 先渲染一帧以获取实际尺寸
+            try:
+                if hasattr(env, 'pyenv'):
+                    base_env = env.pyenv.envs[0]
+                    if hasattr(base_env, 'render'):
+                        test_frame = base_env.render(mode='rgb_array')
+                        if test_frame is not None:
+                            height, width = test_frame.shape[:2]
+                        else:
+                            height, width = 240, 320
+                    else:
+                        height, width = 240, 320
+                else:
+                    height, width = 240, 320
+                
+                # 确保尺寸是偶数（避免 codec 问题）
+                if height % 2 != 0:
+                    height -= 1
+                if width % 2 != 0:
+                    width -= 1
+                
+                # 尝试多种编码格式（按兼容性排序）
+                fourcc_options = [
+                    cv2.VideoWriter_fourcc(*'XVID'),  # 最兼容
+                    cv2.VideoWriter_fourcc(*'mp4v'),  # 备选
+                    cv2.VideoWriter_fourcc(*'H264'),  # 如果支持
+                ]
+                
+                video_writer = None
+                for fourcc in fourcc_options:
+                    try:
+                        video_writer = cv2.VideoWriter(
+                            str(video_path), fourcc, 10.0, (width, height)
+                        )
+                        if video_writer.isOpened():
+                            break
+                        else:
+                            video_writer.release()
+                            video_writer = None
+                    except:
+                        if video_writer is not None:
+                            video_writer.release()
+                            video_writer = None
+                        continue
+                
+                if video_writer is None or not video_writer.isOpened():
+                    print(f"警告: 无法创建视频文件 {video_path}")
+                    video_writer = None
+                else:
+                    print(f"  创建视频文件: {video_path} (尺寸: {width}x{height})")
+            except Exception as e:
+                print(f"警告: 创建视频写入器失败: {e}")
+                import traceback
+                traceback.print_exc()
+                video_writer = None
+        
+        # 初始化观测序列
+        obs_seq_list = []
+        step_count = 0
+        success = False
+        final_goal_distance = None
+        
+        # 保存第一帧（reset 后的初始状态）
+        if video_writer is not None:
+            try:
+                # 获取底层环境（HistoryWrapper -> GymWrapper -> TFPyEnvironment -> BlockPush）
+                base_env = env
+                while hasattr(base_env, '_env'):
+                    base_env = base_env._env
+                
+                # 如果是 TFPyEnvironment，获取实际的 gym 环境
+                if hasattr(base_env, 'pyenv'):
+                    base_env = base_env.pyenv.envs[0]
+                
+                # 调用 render 方法
+                if hasattr(base_env, 'render'):
+                    frame = base_env.render(mode='rgb_array')
+                    if frame is not None and frame.size > 0:
+                        h, w = frame.shape[:2]
+                        if h % 2 != 0:
+                            frame = frame[:h-1, :, :]
+                        if w % 2 != 0:
+                            frame = frame[:, :w-1, :]
+                        if frame.shape[2] == 3:
+                            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                            video_writer.write(frame_bgr)
+                            video_frames.append(frame_bgr.copy())
+                            print(f"    第一帧已保存 (尺寸: {w}x{h})")
+                    else:
+                        print(f"    警告: render 返回 None 或空帧")
+                else:
+                    print(f"    警告: 底层环境没有 render 方法")
+            except Exception as e:
+                print(f"    警告: 保存第一帧时出错: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        while not time_step.is_last() and step_count < max_steps:
+            # 获取当前观测
+            obs_dict = time_step.observation
+            
+            # HistoryWrapper 已经堆叠了观测，我们需要提取每个时间步的观测
+            # obs_dict 中的每个字段形状是 (history_length, ...)
+            # 我们需要构建 (history_length, obs_dim) 的观测序列
+            
+            # 提取每个时间步的观测
+            obs_seq_steps = []
+            for t in range(history_length):
+                obs_dict_t = {}
+                for key, value in obs_dict.items():
+                    value = np.array(value)
+                    if value.ndim > 1:
+                        # 已被堆叠，取第 t 个时间步
+                        obs_dict_t[key] = value[t] if t < value.shape[0] else value[-1]
+                    else:
+                        # 单个观测（可能是第一步，HistoryWrapper 还没堆叠）
+                        obs_dict_t[key] = value
+                
+                # 展平并归一化这个时间步的观测
+                obs_flat_t = flatten_observation(obs_dict_t)
+                if norm_params is not None and norm_params.get('obs_mean') is not None:
+                    obs_mean = np.array(norm_params['obs_mean'])
+                    obs_std = np.array(norm_params['obs_std'])
+                    obs_norm_t = (obs_flat_t - obs_mean) / obs_std
+                else:
+                    obs_norm_t = obs_flat_t
+                obs_seq_steps.append(obs_norm_t)
+            
+            # 构建观测序列张量
+            obs_seq = torch.from_numpy(np.array(obs_seq_steps)).float().unsqueeze(0).to(device)  # (1, history_length, obs_dim)
+            
+            # 推理动作（归一化空间）- 测量时间
+            inference_start = time.perf_counter()
+            action_norm = infer_action(
+                model, obs_seq, ula_sampler,
+                num_action_samples=num_action_samples,
+                device=device
+            )
+            inference_end = time.perf_counter()
+            inference_time = inference_end - inference_start
+            inference_times.append(inference_time)
+            total_inference_time += inference_time
+            
+            # 反归一化动作到原始空间
+            action_orig = denormalize_action(action_norm, norm_params)
+            
+            # 执行动作（包括 IK 求解）- 测量时间
+            execution_start = time.perf_counter()
+            time_step = env.step(action_orig)
+            execution_end = time.perf_counter()
+            execution_time = execution_end - execution_start
+            execution_times.append(execution_time)
+            total_execution_time += execution_time
+            total_steps += 1
+            
+            # 保存视频帧（在执行动作之后，显示新的状态）
+            if video_writer is not None:
+                try:
+                    # 获取底层环境（HistoryWrapper -> GymWrapper -> TFPyEnvironment -> BlockPush）
+                    base_env = env
+                    while hasattr(base_env, '_env'):
+                        base_env = base_env._env
+                    
+                    # 如果是 TFPyEnvironment，获取实际的 gym 环境
+                    if hasattr(base_env, 'pyenv'):
+                        base_env = base_env.pyenv.envs[0]
+                    
+                    # 调用 render 方法
+                    if hasattr(base_env, 'render'):
+                        frame = base_env.render(mode='rgb_array')
+                        if frame is not None and frame.size > 0:
+                            # 确保尺寸是偶数（避免 codec 问题）
+                            h, w = frame.shape[:2]
+                            if h % 2 != 0:
+                                frame = frame[:h-1, :, :]
+                                h -= 1
+                            if w % 2 != 0:
+                                frame = frame[:, :w-1, :]
+                                w -= 1
+                            
+                            # 转换 RGB 到 BGR（opencv 使用 BGR）
+                            if frame.shape[2] == 3:
+                                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                                video_writer.write(frame_bgr)
+                                video_frames.append(frame_bgr.copy())
+                except Exception as e:
+                    # 如果渲染失败，跳过这一帧（不打印错误，避免输出过多）
+                    pass
+            
+            step_count += 1
+        
+        # 获取最终状态
+        # 需要获取底层 BlockPush 环境来判断是否成功（box 是否在目标区域内）
+        try:
+            # 获取底层环境（HistoryWrapper -> GymWrapper -> TFPyEnvironment -> BlockPush）
+            base_env = env
+            while hasattr(base_env, '_env'):
+                base_env = base_env._env
+            
+            # 如果是 TFPyEnvironment，获取实际的 gym 环境
+            if hasattr(base_env, 'pyenv'):
+                base_env = base_env.pyenv.envs[0]
+            
+            # 检查是否成功（box 是否在目标区域内）
+            # BlockPush 环境的 succeeded 属性会检查 goal_distance < goal_dist_tolerance
+            if hasattr(base_env, 'succeeded'):
+                success = bool(base_env.succeeded)
+            else:
+                # 如果没有 succeeded 属性，通过 goal_distance 判断
+                if hasattr(base_env, 'goal_distance'):
+                    goal_dist = float(base_env.goal_distance)
+                    # 获取目标容差（默认 0.01，即 1cm）
+                    goal_tolerance = getattr(base_env, 'goal_dist_tolerance', 0.01)
+                    success = goal_dist < goal_tolerance
+                else:
+                    success = False
+            
+            # 获取最终目标距离
+            if hasattr(base_env, 'goal_distance'):
+                final_goal_distance = float(base_env.goal_distance)
+        except Exception as e:
+            # 如果获取失败，使用默认值
+            success = False
+            final_goal_distance = None
+        
+        # 关闭视频写入器
+        if video_writer is not None:
+            try:
+                # 确保写入最后一帧（如果需要）
+                if len(video_frames) > 0:
+                    # 写入最后一帧
+                    video_writer.write(video_frames[-1])
+                
+                video_writer.release()
+                video_writer = None
+                
+                if ep_idx < video_episodes and video_path is not None:
+                    # 检查文件是否存在且大小合理
+                    if video_path.exists() and video_path.stat().st_size > 0:
+                        print(f"  视频已保存: {video_path} ({len(video_frames)} 帧)")
+                    else:
+                        print(f"  警告: 视频文件可能未正确保存: {video_path}")
+            except Exception as e:
+                print(f"  警告: 关闭视频写入器时出错: {e}")
+        
+        successes.append(success)
+        if final_goal_distance is not None:
+            final_goal_distances.append(final_goal_distance)
+        episode_lengths.append(step_count)
+    
+    # 关闭环境
+    env.close()
+    
+    # 计算统计信息
+    success_rate = np.mean(successes) if successes else 0.0
+    avg_final_goal_distance = np.mean(final_goal_distances) if final_goal_distances else None
+    avg_episode_length = np.mean(episode_lengths) if episode_lengths else 0.0
+    
+    # 计算频率统计
+    avg_inference_time = np.mean(inference_times) if inference_times else 0.0
+    avg_execution_time = np.mean(execution_times) if execution_times else 0.0
+    min_inference_time = np.min(inference_times) if inference_times else 0.0
+    max_inference_time = np.max(inference_times) if inference_times else 0.0
+    min_execution_time = np.min(execution_times) if execution_times else 0.0
+    max_execution_time = np.max(execution_times) if execution_times else 0.0
+    
+    # 计算频率（Hz）
+    inference_freq = 1.0 / avg_inference_time if avg_inference_time > 0 else 0.0
+    execution_freq = 1.0 / avg_execution_time if avg_execution_time > 0 else 0.0
+    
+    # 总时间
+    total_time = total_inference_time + total_execution_time
+    avg_total_time = total_time / total_steps if total_steps > 0 else 0.0
+    overall_freq = 1.0 / avg_total_time if avg_total_time > 0 else 0.0
+    
+    results = {
+        'success_rate': success_rate,
+        'avg_final_goal_distance': avg_final_goal_distance,
+        'avg_episode_length': avg_episode_length,
+        'num_episodes': num_episodes,
+        'num_successes': sum(successes),
+        'successes': successes,
+        'final_goal_distances': final_goal_distances,
+        'episode_lengths': episode_lengths,
+        'inference_stats': {
+            'avg_time_ms': avg_inference_time * 1000,
+            'min_time_ms': min_inference_time * 1000,
+            'max_time_ms': max_inference_time * 1000,
+            'frequency_hz': inference_freq,
+            'total_time_s': total_inference_time
+        },
+        'execution_stats': {
+            'avg_time_ms': avg_execution_time * 1000,
+            'min_time_ms': min_execution_time * 1000,
+            'max_time_ms': max_execution_time * 1000,
+            'frequency_hz': execution_freq,
+            'total_time_s': total_execution_time
+        },
+        'overall_stats': {
+            'avg_total_time_ms': avg_total_time * 1000,
+            'overall_frequency_hz': overall_freq,
+            'total_steps': total_steps
+        }
+    }
+    
+    print("\n" + "=" * 60)
+    print("评估结果")
+    print("=" * 60)
+    print(f"成功率: {success_rate * 100:.2f}% ({sum(successes)}/{num_episodes})")
+    if avg_final_goal_distance is not None:
+        print(f"平均最终目标距离: {avg_final_goal_distance:.4f}")
+    print(f"平均 Episode 长度: {avg_episode_length:.2f} 步")
+    print()
+    print("-" * 60)
+    print("推理频率统计（EBM 推理）")
+    print("-" * 60)
+    print(f"平均推理时间: {avg_inference_time * 1000:.2f} ms")
+    print(f"最小推理时间: {min_inference_time * 1000:.2f} ms")
+    print(f"最大推理时间: {max_inference_time * 1000:.2f} ms")
+    print(f"推理频率: {inference_freq:.2f} Hz")
+    print(f"总推理时间: {total_inference_time:.2f} s")
+    print()
+    print("-" * 60)
+    print("执行频率统计（IK 求解 + 环境步进）")
+    print("-" * 60)
+    print(f"平均执行时间: {avg_execution_time * 1000:.2f} ms")
+    print(f"最小执行时间: {min_execution_time * 1000:.2f} ms")
+    print(f"最大执行时间: {max_execution_time * 1000:.2f} ms")
+    print(f"执行频率: {execution_freq:.2f} Hz")
+    print(f"总执行时间: {total_execution_time:.2f} s")
+    print()
+    print("-" * 60)
+    print("整体频率统计（推理 + 执行）")
+    print("-" * 60)
+    print(f"平均总时间: {avg_total_time * 1000:.2f} ms")
+    print(f"整体频率: {overall_freq:.2f} Hz")
+    print(f"总步数: {total_steps}")
+    print("=" * 60)
+    
+    return results
+
+
+if __name__ == '__main__':
+    # 获取 IBC_ebm_dp 根目录
+    IBC_ROOT = Path(__file__).parent.parent.parent
+    
+    # ============================================
+    # 配置参数（显式设置，不使用命令行参数）
+    # ============================================
+    
+    # 模型路径：自动查找最新的 checkpoint
+    def find_default_model():
+        """查找默认模型文件（优先 final_model.pth，否则选择最新的 checkpoint）"""
+        checkpoints_dir = IBC_ROOT / 'models' / 'pushing_states' / 'checkpoints'
+        
+        # 优先查找 final_model.pth
+        final_model = checkpoints_dir / 'final_model.pth'
+        if final_model.exists():
+            return final_model
+        
+        # 否则查找最新的 checkpoint
+        if checkpoints_dir.exists():
+            checkpoint_files = sorted(checkpoints_dir.glob('checkpoint_*.pth'))
+            if checkpoint_files:
+                return checkpoint_files[-1]  # 返回最新的
+        
+        return None
+    
+    model_path = find_default_model()
+    if model_path is None:
+        print("错误: 未找到模型文件")
+        checkpoints_dir = IBC_ROOT / 'models' / 'pushing_states' / 'checkpoints'
+        if checkpoints_dir.exists():
+            model_files = list(checkpoints_dir.glob('*.pth'))
+            if model_files:
+                print(f"  找到以下模型文件:")
+                for f in sorted(model_files):
+                    print(f"    {f}")
+        sys.exit(1)
+    
+    # 评估参数
+    num_episodes = 10
+    max_steps = 100
+    num_action_samples = 256
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    shared_memory = False
+    seed = None
+    
+    # 视频保存参数
+    save_video = True
+    video_output_dir = IBC_ROOT / 'plots' / 'pushing_states'  # 视频输出目录
+    video_episodes = num_episodes  # 保存所有 episodes 的视频（设置为 num_episodes 以保存全部）
+    
+    # ============================================
+    # 执行评估
+    # ============================================
+    
+    print(f"使用模型: {model_path}")
+    print(f"视频输出目录: {video_output_dir}")
+    print()
+    
+    # 加载模型
+    model, checkpoint, norm_params = load_model(str(model_path), device=device)
+    
+    # 评估策略
+    results = evaluate_policy(
+        model=model,
+        norm_params=norm_params,
+        num_episodes=num_episodes,
+        max_steps=max_steps,
+        num_action_samples=num_action_samples,
+        device=device,
+        shared_memory=shared_memory,
+        seed=seed,
+        save_video=save_video,
+        video_output_dir=str(video_output_dir),
+        video_episodes=video_episodes
+    )
+    
+    # 保存结果
+    output_path = model_path.parent / 'eval_results.json'
+    with open(output_path, 'w') as f:
+        json.dump(results, f, indent=2)
+    print(f"\n评估结果已保存到: {output_path}")
+
