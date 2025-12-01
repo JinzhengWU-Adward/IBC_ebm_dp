@@ -584,3 +584,341 @@ class SequenceEBM(nn.Module):
         
         return energy.view(B, N)
 
+
+class ConvMaxpoolEncoder(nn.Module):
+    """
+    ConvMaxpoolEncoder: 简单的 4 层 Conv2D + MaxPool2D CNN
+    
+    匹配 IBC 官方的 conv_maxpool.get_conv_maxpool 架构：
+    - Conv2D(32) -> MaxPool2D -> Conv2D(64) -> MaxPool2D -> 
+      Conv2D(128) -> MaxPool2D -> Conv2D(256) -> MaxPool2D -> GlobalAveragePooling2D
+    
+    输出: (B, 256) 特征向量
+    """
+    
+    def __init__(self, in_channels: int = 3):
+        """
+        Args:
+            in_channels: 输入通道数（例如 3*sequence_length 用于堆叠的图像序列）
+        """
+        super().__init__()
+        
+        self.conv1 = nn.Conv2d(in_channels, 32, 3, padding=1)
+        self.pool1 = nn.MaxPool2d(2, 2)
+        
+        self.conv2 = nn.Conv2d(32, 64, 3, padding=1)
+        self.pool2 = nn.MaxPool2d(2, 2)
+        
+        self.conv3 = nn.Conv2d(64, 128, 3, padding=1)
+        self.pool3 = nn.MaxPool2d(2, 2)
+        
+        self.conv4 = nn.Conv2d(128, 256, 3, padding=1)
+        self.pool4 = nn.MaxPool2d(2, 2)
+        
+        self.global_pool = nn.AdaptiveAvgPool2d(1)  # GlobalAveragePooling2D
+        self.activation = nn.ReLU()
+        
+        # 初始化权重（匹配 IBC 的 'normal' 初始化）
+        self._init_weights()
+    
+    def _init_weights(self):
+        """初始化权重，匹配 IBC 的 'normal' 初始化 (std=0.05)"""
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                nn.init.normal_(module.weight, mean=0.0, std=0.05)
+                if module.bias is not None:
+                    nn.init.normal_(module.bias, mean=0.0, std=0.05)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        前向传播
+        
+        Args:
+            x: 输入图像，形状为 (B, C, H, W)
+            
+        Returns:
+            特征向量，形状为 (B, 256)
+        """
+        x = self.activation(self.conv1(x))
+        x = self.pool1(x)
+        
+        x = self.activation(self.conv2(x))
+        x = self.pool2(x)
+        
+        x = self.activation(self.conv3(x))
+        x = self.pool3(x)
+        
+        x = self.activation(self.conv4(x))
+        x = self.pool4(x)
+        
+        # GlobalAveragePooling2D
+        x = self.global_pool(x)  # (B, 256, 1, 1)
+        x = x.view(x.size(0), -1)  # (B, 256)
+        
+        return x
+
+
+class ResNetDenseBlock(nn.Module):
+    """
+    Dense ResNet 块（匹配 IBC 的 ResNetDenseBlock）
+    
+    结构:
+      y = ReLU -> Dense(width//4) -> ReLU -> Dense(width//4) -> 
+          ReLU -> Dense(width) -> ReLU -> Dense(width)
+      if x.shape != y.shape:
+        x = ReLU -> Dense(width)
+      return x + y
+    """
+    
+    def __init__(self, width: int):
+        """
+        Args:
+            width: 隐藏层维度
+        """
+        super().__init__()
+        
+        # 匹配 IBC 官方的 dense_resnet_value.py 中的 ResNetDenseBlock
+        # dense(width // 4) 表示输出维度为 width // 4，输入维度自动推断
+        # 在 TensorFlow 中，如果输入是 (B, width)，Dense(width // 4) 会创建 (width, width // 4) 的权重
+        # 在 PyTorch 中，需要明确指定输入和输出维度
+        self.dense0 = nn.Linear(width, width // 4)  # 从 width 降到 width // 4
+        self.dense1 = nn.Linear(width // 4, width // 4)  # 保持 width // 4
+        self.dense2 = nn.Linear(width // 4, width)  # 从 width // 4 升到 width
+        self.dense3 = nn.Linear(width, width)  # 用于形状不匹配时的投影
+        
+        self.activation = nn.ReLU()
+        
+        # 初始化权重
+        self._init_weights()
+    
+    def _init_weights(self):
+        """初始化权重，匹配 IBC 的 'normal' 初始化"""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=0.05)
+                if module.bias is not None:
+                    nn.init.normal_(module.bias, mean=0.0, std=0.05)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        前向传播（匹配 IBC 官方实现）
+        
+        Args:
+            x: 输入张量，形状为 (B, width)
+            
+        Returns:
+            输出张量，形状为 (B, width)
+        
+        匹配 IBC 官方的 dense_resnet_value.py：
+        y = dense0(activation0(x))
+        y = dense1(activation1(y))
+        y = dense2(activation2(y))
+        if x.shape != y.shape:
+            x = dense3(activation3(x))
+        return x + y
+        """
+        identity = x
+        
+        # 匹配 IBC 官方：y = dense0(activation0(x))
+        y = self.dense0(self.activation(x))
+        # 匹配 IBC 官方：y = dense1(activation1(y))
+        y = self.dense1(self.activation(y))
+        # 匹配 IBC 官方：y = dense2(activation2(y))
+        y = self.dense2(self.activation(y))
+        
+        # 如果形状不匹配，投影 identity（匹配 IBC 官方）
+        if identity.shape != y.shape:
+            identity = self.dense3(self.activation(identity))
+        
+        return identity + y
+
+
+class DenseResnetValue(nn.Module):
+    """
+    Dense ResNet Value Network（匹配 IBC 的 DenseResnetValue）
+    
+    结构: Dense(width) -> ResNetDenseBlock * num_blocks -> Dense(1)
+    
+    用于计算能量值：E(obs_encoding, action)
+    """
+    
+    def __init__(self, input_dim: int, width: int = 1024, num_blocks: int = 1):
+        """
+        Args:
+            input_dim: 输入维度（obs_encoding_dim + action_dim）
+            width: 隐藏层维度（默认 1024，匹配 gin 配置）
+            num_blocks: ResNet 块数量（默认 1，匹配 gin 配置）
+        """
+        super().__init__()
+        
+        self.dense0 = nn.Linear(input_dim, width)
+        self.blocks = nn.ModuleList([
+            ResNetDenseBlock(width) for _ in range(num_blocks)
+        ])
+        self.dense1 = nn.Linear(width, 1)
+        
+        # 初始化权重
+        self._init_weights()
+    
+    def _init_weights(self):
+        """初始化权重，匹配 IBC 的 'normal' 初始化"""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=0.05)
+                if module.bias is not None:
+                    nn.init.normal_(module.bias, mean=0.0, std=0.05)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        前向传播
+        
+        Args:
+            x: 输入张量，形状为 (B*N, obs_encoding_dim + action_dim)
+               其中 N 是 action 候选数量
+               
+        Returns:
+            能量值，形状为 (B*N, 1)
+        """
+        x = self.dense0(x)  # 无激活（匹配 IBC）
+        
+        for block in self.blocks:
+            x = block(x)
+        
+        x = self.dense1(x)  # 无激活（匹配 IBC）
+        
+        return x
+
+
+class PixelEBM(nn.Module):
+    """
+    PixelEBM: 基于图像的 Energy-Based Model（匹配 IBC 官方架构）
+    
+    支持 Late Fusion：
+    1. 先编码图像序列得到 obs_encoding
+    2. 对每个 action 候选，拼接 [obs_encoding, action] 输入 value network
+    3. 输出能量值 E(obs, action)
+    
+    架构:
+    - Encoder: ConvMaxpoolEncoder (将图像序列编码为特征向量)
+    - Value Network: DenseResnetValue (计算能量值)
+    
+    参考: IBC 官方的 PixelEBM 和 pixel_ebm_langevin.gin 配置
+    """
+    
+    def __init__(
+        self,
+        image_channels: int = 6,  # 3 * sequence_length (默认 sequence_length=2)
+        action_dim: int = 2,
+        target_height: int = 180,  # 匹配 gin: PixelEBM.target_height = 180
+        target_width: int = 240,   # 匹配 gin: PixelEBM.target_width = 240
+        value_width: int = 1024,   # 匹配 gin: DenseResnetValue.width = 1024
+        value_num_blocks: int = 1, # 匹配 gin: DenseResnetValue.num_blocks = 1
+    ):
+        """
+        Args:
+            image_channels: 输入图像通道数（3 * sequence_length，图像序列堆叠在通道维度）
+            action_dim: 动作维度
+            target_height: 目标图像高度（编码前会 resize 到此尺寸）
+            target_width: 目标图像宽度
+            value_width: Value Network 的隐藏层维度
+            value_num_blocks: Value Network 的 ResNet 块数量
+        """
+        super().__init__()
+        
+        self.target_height = target_height
+        self.target_width = target_width
+        
+        # Encoder: 将图像编码为特征向量
+        self.encoder = ConvMaxpoolEncoder(in_channels=image_channels)
+        obs_encoding_dim = 256  # ConvMaxpoolEncoder 输出维度
+        
+        # Value Network: 计算能量值 E(obs_encoding, action)
+        value_input_dim = obs_encoding_dim + action_dim
+        self.value_network = DenseResnetValue(
+            input_dim=value_input_dim,
+            width=value_width,
+            num_blocks=value_num_blocks
+        )
+    
+    def encode(self, images: torch.Tensor) -> torch.Tensor:
+        """
+        编码图像序列为特征向量（匹配 IBC 官方流程）
+        
+        Args:
+            images: 输入图像，形状为 (B, seq_len, H, W, 3) 或 (seq_len, H, W, 3)
+                   注意：这里是原始尺寸，未 resize 和堆叠
+                   匹配 IBC: obs['rgb'] 的形状 (B, seq_len, H_orig, W_orig, 3)
+                   
+        Returns:
+            特征向量，形状为 (B, 256)
+        """
+        # 处理单样本情况
+        if images.dim() == 4:
+            images = images.unsqueeze(0)  # (1, seq_len, H, W, 3)
+        
+        B, seq_len, H, W, C = images.shape
+        
+        # ⚠️ 关键修复：匹配 IBC 官方的 image_prepro.preprocess 流程
+        # 1. 堆叠图像序列在通道维度（匹配 IBC: stack_images_channelwise）
+        # (B, seq_len, H, W, 3) -> (B, H, W, 3*seq_len)
+        images = images.permute(0, 2, 3, 1, 4)  # (B, H, W, seq_len, 3)
+        images = images.reshape(B, H, W, seq_len * C)  # (B, H, W, 3*seq_len)
+        
+        # 2. 转换为 NCHW 格式以便使用 F.interpolate
+        images = images.permute(0, 3, 1, 2)  # (B, 3*seq_len, H, W)
+        
+        # 3. Resize 到目标尺寸（在 GPU 上动态执行，匹配 IBC）
+        # IBC 在模型内部进行 resize，每次前向传播时执行
+        if images.shape[2] != self.target_height or images.shape[3] != self.target_width:
+            images = F.interpolate(
+                images,
+                size=(self.target_height, self.target_width),
+                mode='bilinear',
+                align_corners=False
+            )
+        
+        # 4. 编码
+        obs_encoding = self.encoder(images)  # (B, 256)
+        return obs_encoding
+    
+    def forward(
+        self, 
+        images: torch.Tensor, 
+        actions: torch.Tensor,
+        obs_encoding: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        前向传播：计算能量值（支持 Late Fusion）
+        
+        Args:
+            images: 输入图像，形状为 (B, C, H, W)
+                   如果提供了 obs_encoding，此参数可忽略
+            actions: 动作候选，形状为 (B, N, action_dim)
+                    其中 N 是候选数量
+            obs_encoding: 可选的预编码观测特征，形状为 (B, 256)
+                         如果为 None，则从 images 编码
+                         
+        Returns:
+            能量值，形状为 (B, N)
+            能量值越低表示该动作越可能是正确的预测
+        """
+        # Late Fusion: 如果未提供 obs_encoding，先编码图像
+        if obs_encoding is None:
+            obs_encoding = self.encode(images)  # (B, 256)
+        
+        B = obs_encoding.size(0)
+        N = actions.size(1)
+        
+        # 扩展 obs_encoding 以匹配 action 候选数量
+        obs_encoding_expanded = obs_encoding.unsqueeze(1).expand(B, N, -1)  # (B, N, 256)
+        
+        # 拼接 [obs_encoding, action]
+        fused = torch.cat([obs_encoding_expanded, actions], dim=-1)  # (B, N, 256 + action_dim)
+        fused = fused.reshape(B * N, -1)  # (B*N, 256 + action_dim)
+        
+        # 计算能量值
+        energy = self.value_network(fused)  # (B*N, 1)
+        energy = energy.view(B, N)  # (B, N)
+        
+        return energy
+

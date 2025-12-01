@@ -1,13 +1,14 @@
 """
-Block Pushing (states) 环境 EBM 模型测试脚本
-在 pybullet 环境中加载训练好的模型并进行评估
-复现 IBC 的 run_mlp_ebm_langevin.sh 评估场景
+Block Pushing (RGB 图像) 环境 EBM 模型测试脚本
+在 pybullet 环境中加载训练好的 PixelEBM 模型并进行评估
+复现 IBC 的 run_pixel_ebm_langevin.sh 评估场景
 """
 import numpy as np
 import json
 from pathlib import Path
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import sys
 from tqdm import tqdm
 import copy
@@ -33,7 +34,7 @@ except ImportError:
 IBC_ROOT = Path(__file__).parent.parent.parent  # IBC_ebm_dp
 sys.path.insert(0, str(IBC_ROOT))
 
-from core.models import SequenceEBM
+from core.models import PixelEBM
 from core.optimizers import ULASampler
 
 # 添加 IBC 路径以便导入环境
@@ -50,14 +51,10 @@ from tf_agents.trajectories import time_step as ts
 
 from ibc.environments.block_pushing import block_pushing
 
-# 导入训练脚本中的工具函数
-sys.path.insert(0, str(Path(__file__).parent))
-from pushing_states_train import flatten_observation
-
 
 def load_model(model_path, device='cuda' if torch.cuda.is_available() else 'cpu'):
     """
-    加载训练好的 SequenceEBM 模型
+    加载训练好的 PixelEBM 模型
     
     Args:
         model_path: 模型文件路径
@@ -72,29 +69,28 @@ def load_model(model_path, device='cuda' if torch.cuda.is_available() else 'cpu'
     checkpoint = torch.load(model_path, map_location=device)
     
     # 获取模型参数
-    obs_dim = checkpoint.get('obs_dim', 10)
     action_dim = checkpoint.get('action_dim', 2)
     obs_seq_len = checkpoint.get('obs_seq_len', 2)
-    hidden_dim = checkpoint.get('hidden_dim', 128)
-    num_residual_blocks = checkpoint.get('num_residual_blocks', 8)
-    dropout = checkpoint.get('dropout', 0.0)
-    norm_type = checkpoint.get('norm_type', None)
+    target_height = checkpoint.get('target_height', 180)
+    target_width = checkpoint.get('target_width', 240)
+    image_channels = checkpoint.get('image_channels', 6)  # 3 * sequence_length
+    value_width = checkpoint.get('value_width', 1024)
+    value_num_blocks = checkpoint.get('value_num_blocks', 1)
     norm_params = checkpoint.get('norm_params', None)
     
     print(f"模型参数:")
-    print(f"  obs_dim={obs_dim}, action_dim={action_dim}, obs_seq_len={obs_seq_len}")
-    print(f"  hidden_dim={hidden_dim}, num_residual_blocks={num_residual_blocks}")
-    print(f"  dropout={dropout}, norm_type={norm_type}")
+    print(f"  action_dim={action_dim}, obs_seq_len={obs_seq_len}")
+    print(f"  target_height={target_height}, target_width={target_width}")
+    print(f"  image_channels={image_channels}, value_width={value_width}, value_num_blocks={value_num_blocks}")
     
-    # 创建 SequenceEBM
-    model = SequenceEBM(
-        obs_dim=obs_dim,
+    # 创建 PixelEBM
+    model = PixelEBM(
+        image_channels=image_channels,
         action_dim=action_dim,
-        obs_seq_len=obs_seq_len,
-        hidden_dim=hidden_dim,
-        num_residual_blocks=num_residual_blocks,
-        dropout=dropout,
-        norm_type=norm_type
+        target_height=target_height,
+        target_width=target_width,
+        value_width=value_width,
+        value_num_blocks=value_num_blocks
     )
     
     # 加载模型权重
@@ -129,46 +125,63 @@ def denormalize_action(action_norm, norm_params):
     return action_orig
 
 
-def normalize_observation(obs_dict, norm_params):
+# 注意：normalize_image 函数已不再使用，因为 stack_image_sequence 现在直接处理
+# 保留此函数以防其他地方需要，但推荐使用 stack_image_sequence
+def normalize_image(image, target_height=180, target_width=240):
     """
-    将观测字典归一化
+    归一化图像到 [0, 1] 并 resize 到目标尺寸（已废弃，推荐使用 stack_image_sequence）
     
     Args:
-        obs_dict: 观测字典（可能已经被 HistoryWrapper 堆叠）
-        norm_params: 归一化参数
+        image: 输入图像，形状为 (H, W, 3)，值范围 [0, 255]
+        target_height: 目标高度
+        target_width: 目标宽度
     
     Returns:
-        obs_norm: 归一化后的观测向量 (10,)
+        image_norm: 归一化后的图像，形状为 (target_height, target_width, 3)，值范围 [0, 1]
     """
-    # 检查观测是否已被 HistoryWrapper 堆叠
-    # 如果堆叠，每个字段的形状是 (history_length, ...)
-    # 我们需要取最后一个时间步的观测
-    obs_dict_current = {}
-    for key, value in obs_dict.items():
-        value = np.array(value)
-        if value.ndim > 1:
-            # 已被堆叠，取最后一个时间步
-            obs_dict_current[key] = value[-1]
-        else:
-            # 单个观测
-            obs_dict_current[key] = value
+    # 转换为 float32 并归一化到 [0, 1]
+    image = image.astype(np.float32) / 255.0
     
-    # 展平观测
-    obs_flat = flatten_observation(obs_dict_current)
+    # Resize（如果需要）
+    if image.shape[0] != target_height or image.shape[1] != target_width:
+        import cv2
+        image = cv2.resize(image, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
     
-    if norm_params is None or norm_params.get('obs_mean') is None:
-        return obs_flat
+    return image
+
+
+def stack_image_sequence(images_list, target_height=180, target_width=240):
+    """
+    准备图像序列用于模型输入（匹配 IBC 官方流程）
     
-    obs_mean = np.array(norm_params['obs_mean'])
-    obs_std = np.array(norm_params['obs_std'])
+    ⚠️ 关键修复：匹配训练代码的修改
+    - 只归一化，不进行堆叠和 resize
+    - 堆叠和 resize 在模型内部的 encode 方法中执行（GPU 上）
     
-    obs_norm = (obs_flat - obs_mean) / obs_std
-    return obs_norm
+    Args:
+        images_list: 图像列表，每个图像形状为 (H, W, 3)，值范围 [0, 255]
+        target_height: 目标高度（用于文档，实际 resize 在模型内部执行）
+        target_width: 目标宽度（用于文档，实际 resize 在模型内部执行）
+    
+    Returns:
+        image_sequence: 图像序列，形状为 (seq_len, H_orig, W_orig, 3)
+                       值范围 [0, 1]，保持原始尺寸
+    """
+    # 只归一化，不进行堆叠和 resize（匹配训练代码）
+    normalized_images = []
+    for img in images_list:
+        img_norm = img.astype(np.float32) / 255.0  # (H, W, 3)
+        normalized_images.append(img_norm)
+    
+    # 转换为序列格式 (seq_len, H, W, 3)，保持原始尺寸
+    image_sequence = np.stack(normalized_images, axis=0)  # (seq_len, H_orig, W_orig, 3)
+    
+    return image_sequence
 
 
 def plot_energy_landscape(
-    model: SequenceEBM,
-    obs_seq: torch.Tensor,  # (1, obs_seq_len, obs_dim)
+    model: PixelEBM,
+    images: torch.Tensor,  # (1, seq_len, H_orig, W_orig, 3) 或 (seq_len, H_orig, W_orig, 3)
     norm_params: dict,
     action_range: tuple = None,  # ((min_x, max_x), (min_y, max_y))，如果为None则从norm_params推断
     grid_size: int = 50,
@@ -179,12 +192,12 @@ def plot_energy_landscape(
     绘制能量图景（反归一化后的动作空间）
     
     Args:
-        model: SequenceEBM 模型
-        obs_seq: 观测序列，形状为 (1, obs_seq_len, obs_dim)
+        model: PixelEBM 模型
+        images: 图像序列，形状为 (1, seq_len, H_orig, W_orig, 3) 或 (seq_len, H_orig, W_orig, 3)
+               注意：保持原始尺寸，堆叠和 resize 在模型内部执行
         norm_params: 归一化参数
         action_range: 动作范围 ((min_x, max_x), (min_y, max_y))，如果为None则从norm_params推断
         grid_size: 网格大小（每边的点数）
-        current_action: 当前选择的动作（反归一化后的原始空间），形状为 (2,)
         device: 计算设备
     
     Returns:
@@ -242,10 +255,15 @@ def plot_energy_landscape(
     
     # 计算能量
     with torch.no_grad():
-        # obs_seq 已经是 (1, obs_seq_len, obs_dim)
-        # actions_norm_tensor 是 (1, grid_size^2, 2)
+        # Late Fusion: 先编码图像
+        obs_encoding = model.encode(images)  # (1, 256)
+        
         # 计算能量
-        energies = model(obs_seq, actions_norm_tensor)  # (1, grid_size^2)
+        energies = model(
+            images=None,
+            actions=actions_norm_tensor,
+            obs_encoding=obs_encoding
+        )  # (1, grid_size^2)
         
         energies_np = energies.squeeze(0).cpu().numpy()  # (grid_size^2,)
     
@@ -292,20 +310,34 @@ def plot_energy_landscape(
 
 
 def infer_action(
-    model: SequenceEBM,
-    obs_seq: torch.Tensor,
+    model: PixelEBM,
+    images: torch.Tensor,  # (1, seq_len, H_orig, W_orig, 3) 或 (seq_len, H_orig, W_orig, 3)
     ula_sampler: ULASampler,
-    num_action_samples: int = 512,
+    num_action_samples: int = 2048,  # 匹配 gin: IbcPolicy.num_action_samples = 2048
+    optimize_again: bool = True,  # 匹配 gin: IbcPolicy.optimize_again = True
+    again_noise_scale: float = 1.0,  # 匹配 gin: IbcPolicy.inference_langevin_noise_scale = 1.0 (默认值)
+    again_step_size_init: float = 1e-1,  # 匹配 gin: IbcPolicy.again_stepsize_init = 1e-1
+    again_step_size_final: float = 1e-5,  # 匹配 gin: IbcPolicy.again_stepsize_final = 1e-5
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
 ):
     """
-    使用 ULA 推理下一个动作（在归一化空间）
+    使用 ULA 推理下一个动作（在归一化空间，支持 Late Fusion）
+    
+    匹配 IBC 官方的 optimize_again 功能：
+    1. 第一次 ULA 采样（带噪声）
+    2. 如果 optimize_again=True，进行第二次 ULA 采样（无噪声或小噪声）
+    3. 选择能量最低的动作
     
     Args:
-        model: 训练好的 SequenceEBM 模型
-        obs_seq: observation 序列（归一化），形状为 (1, obs_seq_len, obs_dim)
-        ula_sampler: ULASampler 实例
+        model: 训练好的 PixelEBM 模型
+        images: 图像序列（归一化），形状为 (1, seq_len, H_orig, W_orig, 3) 或 (seq_len, H_orig, W_orig, 3)
+               注意：保持原始尺寸，堆叠和 resize 在模型内部执行
+        ula_sampler: ULASampler 实例（用于第一次采样）
         num_action_samples: 采样候选数量
+        optimize_again: 是否进行二次优化（匹配 gin: IbcPolicy.optimize_again = True）
+        again_noise_scale: 二次优化时的噪声尺度（通常为 0.0，无噪声）
+        again_step_size_init: 二次优化的初始步长
+        again_step_size_final: 二次优化的最终步长
         device: 计算设备
     
     Returns:
@@ -313,30 +345,74 @@ def infer_action(
     """
     model.eval()
     
+    # Late Fusion: 先编码图像（在模型内部进行堆叠和 resize）
+    with torch.no_grad():
+        obs_encoding = model.encode(images)  # (1, 256)
+    
     # 初始化候选动作（归一化空间 [-1, 1]）
+    # 修复：匹配训练代码的边界扩展公式
     uniform_boundary_buffer = 0.05
     norm_min, norm_max = -1.0, 1.0
-    expanded_min = norm_min - uniform_boundary_buffer * (norm_max - norm_min) * 2.0
-    expanded_max = norm_max + uniform_boundary_buffer * (norm_max - norm_min) * 2.0
+    expanded_min = norm_min - uniform_boundary_buffer * (norm_max - norm_min)
+    expanded_max = norm_max + uniform_boundary_buffer * (norm_max - norm_min)
     
     init_candidates = torch.rand(
         1, num_action_samples, 2,
         device=device
     ) * (expanded_max - expanded_min) + expanded_min
     
-    # ULA 采样
+    # 第一次 ULA 采样（使用 Late Fusion，带噪声）
     with torch.enable_grad():
         candidates, _ = ula_sampler.sample(
-            x=obs_seq,
+            x=images,  # 传入 images（虽然会被忽略，因为使用 obs_encoding）
             ebm=model,
             num_samples=num_action_samples,
             init_samples=init_candidates,
-            return_trajectory=False
+            return_trajectory=False,
+            obs_encoding=obs_encoding.detach()  # Late Fusion
         )
+    
+    # 二次优化（optimize_again）：无噪声的 ULA 采样
+    # 匹配 IBC 官方的实现：使用相同的 langevin_actions_given_obs，但 noise_scale=0.0
+    if optimize_again:
+        # 创建二次优化的 ULA 采样器（使用更小的步长和零噪声）
+        from core.optimizers import ULASampler
+        uniform_boundary_buffer = 0.05
+        norm_min, norm_max = -1.0, 1.0
+        expanded_min = norm_min - uniform_boundary_buffer * (norm_max - norm_min) * 2.0
+        expanded_max = norm_max + uniform_boundary_buffer * (norm_max - norm_min) * 2.0
+        action_bounds = np.array([[expanded_min, expanded_min],
+                                  [expanded_max, expanded_max]], dtype=np.float32)
+        
+        again_ula_sampler = ULASampler(
+            bounds=action_bounds,
+            step_size=again_step_size_init,
+            num_steps=ula_sampler.num_steps,  # 使用相同的步数
+            noise_scale=again_noise_scale,  # 无噪声或小噪声
+            step_size_final=again_step_size_final,
+            step_size_power=ula_sampler.step_size_power,
+            delta_action_clip=ula_sampler.delta_action_clip,
+            device=device
+        )
+        
+        # 第二次 ULA 采样（无噪声）
+        with torch.enable_grad():
+            candidates, _ = again_ula_sampler.sample(
+                x=images,
+                ebm=model,
+                num_samples=num_action_samples,
+                init_samples=candidates,  # 使用第一次采样的结果作为初始值
+                return_trajectory=False,
+                obs_encoding=obs_encoding.detach()  # Late Fusion
+            )
     
     # 计算能量并选择最优动作
     with torch.no_grad():
-        energies = model(obs_seq, candidates)  # (1, num_action_samples)
+        energies = model(
+            images=None,  # 不使用 images，使用 obs_encoding
+            actions=candidates,
+            obs_encoding=obs_encoding
+        )  # (1, num_action_samples)
         best_idx = energies.argmin(dim=1)  # (1,)
         next_action = candidates[0, best_idx[0]]  # (2,)
     
@@ -344,11 +420,11 @@ def infer_action(
 
 
 def evaluate_policy(
-    model: SequenceEBM,
+    model: PixelEBM,
     norm_params: dict,
     num_episodes: int = 20,
     max_steps: int = 100,
-    num_action_samples: int = 512,
+    num_action_samples: int = 2048,  # 匹配 gin: IbcPolicy.num_action_samples = 2048
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
     shared_memory: bool = False,
     seed: int = None,
@@ -359,10 +435,10 @@ def evaluate_policy(
     energy_episodes: int = 1  # 保存前 N 个 episodes 的能量图景
 ):
     """
-    在 pybullet BlockPush 环境中评估策略
+    在 pybullet BlockPush 环境中评估策略（使用 RGB 图像观测）
     
     Args:
-        model: 训练好的 SequenceEBM 模型
+        model: 训练好的 PixelEBM 模型
         norm_params: 归一化参数
         num_episodes: 评估的 episode 数量
         max_steps: 每个 episode 的最大步数
@@ -370,31 +446,38 @@ def evaluate_policy(
         device: 计算设备
         shared_memory: 是否使用共享内存（用于可视化）
         seed: 随机种子
+        save_video: 是否保存视频
+        video_output_dir: 视频输出目录
+        video_episodes: 保存前 N 个 episodes 的视频
     
     Returns:
         results: 评估结果字典
     """
     print("=" * 60)
-    print("在 pybullet BlockPush 环境中评估策略")
+    print("在 pybullet BlockPush 环境中评估策略（RGB 图像观测）")
     print("=" * 60)
     print(f"Episode 数量: {num_episodes}")
     print(f"最大步数: {max_steps}")
     print(f"设备: {device}")
     print()
     
-    # 创建环境
+    # 获取模型参数
+    obs_seq_len = norm_params.get('obs_seq_len', 2)
+    target_height = norm_params.get('target_height', 180)
+    target_width = norm_params.get('target_width', 240)
+    
+    # 创建环境（使用图像观测）
     env_name = block_pushing.build_env_name(
         task="PUSH", 
         shared_memory=shared_memory, 
-        use_image_obs=False
+        use_image_obs=True  # 使用图像观测
     )
     env = suite_gym.load(env_name)
     
     # 添加 HistoryWrapper（匹配训练时的配置）
-    history_length = norm_params.get('obs_seq_len', 2)
     env = wrappers.HistoryWrapper(
         env, 
-        history_length=history_length, 
+        history_length=obs_seq_len, 
         tile_first_step_obs=True
     )
     
@@ -408,8 +491,8 @@ def evaluate_policy(
     
     ula_sampler = ULASampler(
         bounds=action_bounds,
-        step_size=0.2,
-        num_steps=10,
+        step_size=0.1,  # 匹配训练时的配置
+        num_steps=3,  # 匹配 gin: langevin_actions_given_obs.num_iterations = 100
         noise_scale=1.0,
         step_size_final=1e-5,
         step_size_power=2.0,
@@ -504,8 +587,8 @@ def evaluate_policy(
                 traceback.print_exc()
                 video_writer = None
         
-        # 初始化观测序列
-        obs_seq_list = []
+        # 初始化图像序列（用于 HistoryWrapper）
+        image_seq_list = []
         step_count = 0
         success = False
         final_goal_distance = None
@@ -518,10 +601,12 @@ def evaluate_policy(
             energy_path = video_output_dir / f'energy_landscape_episode_{ep_idx:03d}.mp4'
             # 先绘制一帧以获取尺寸
             try:
-                # 创建一个临时观测序列来获取尺寸
-                temp_obs_seq = torch.zeros(1, history_length, 10).to(device)
+                # 创建一个临时图像来获取尺寸（匹配新的数据格式）
+                # 使用原始尺寸的占位图像
+                temp_h, temp_w = 240, 320  # 典型的原始图像尺寸
+                temp_images_tensor = torch.zeros(1, obs_seq_len, temp_h, temp_w, 3).to(device)
                 temp_energy_frame = plot_energy_landscape(
-                    model, temp_obs_seq, norm_params, device=device
+                    model, temp_images_tensor, norm_params, device=device
                 )
                 if temp_energy_frame is not None:
                     h, w = temp_energy_frame.shape[:2]
@@ -589,54 +674,66 @@ def evaluate_policy(
                             video_writer.write(frame_bgr)
                             video_frames.append(frame_bgr.copy())
                             print(f"    第一帧已保存 (尺寸: {w}x{h})")
-                    else:
-                        print(f"    警告: render 返回 None 或空帧")
-                else:
-                    print(f"    警告: 底层环境没有 render 方法")
             except Exception as e:
                 print(f"    警告: 保存第一帧时出错: {e}")
-                import traceback
-                traceback.print_exc()
         
         while not time_step.is_last() and step_count < max_steps:
-            # 获取当前观测
+            # 获取当前观测（RGB 图像）
             obs_dict = time_step.observation
             
-            # HistoryWrapper 已经堆叠了观测，我们需要提取每个时间步的观测
-            # obs_dict 中的每个字段形状是 (history_length, ...)
-            # 我们需要构建 (history_length, obs_dim) 的观测序列
+            # HistoryWrapper 已经堆叠了观测，我们需要提取每个时间步的图像
+            # obs_dict['rgb'] 的形状是 (history_length, H, W, 3)
+            # 我们需要构建图像序列用于模型输入
             
-            # 提取每个时间步的观测
-            obs_seq_steps = []
-            for t in range(history_length):
-                obs_dict_t = {}
-                for key, value in obs_dict.items():
-                    value = np.array(value)
-                    if value.ndim > 1:
-                        # 已被堆叠，取第 t 个时间步
-                        obs_dict_t[key] = value[t] if t < value.shape[0] else value[-1]
-                    else:
-                        # 单个观测（可能是第一步，HistoryWrapper 还没堆叠）
-                        obs_dict_t[key] = value
-                
-                # 展平并归一化这个时间步的观测
-                obs_flat_t = flatten_observation(obs_dict_t)
-                if norm_params is not None and norm_params.get('obs_mean') is not None:
-                    obs_mean = np.array(norm_params['obs_mean'])
-                    obs_std = np.array(norm_params['obs_std'])
-                    obs_norm_t = (obs_flat_t - obs_mean) / obs_std
-                else:
-                    obs_norm_t = obs_flat_t
-                obs_seq_steps.append(obs_norm_t)
+            # 提取每个时间步的图像
+            rgb_obs = obs_dict.get('rgb', None)
+            if rgb_obs is None:
+                print("警告: 观测中没有 'rgb' 字段")
+                break
             
-            # 构建观测序列张量
-            obs_seq = torch.from_numpy(np.array(obs_seq_steps)).float().unsqueeze(0).to(device)  # (1, history_length, obs_dim)
+            rgb_obs = np.array(rgb_obs)
+            
+            # 处理 HistoryWrapper 的堆叠
+            if rgb_obs.ndim == 4:
+                # 形状为 (history_length, H, W, 3)
+                image_seq_list = [rgb_obs[t] for t in range(rgb_obs.shape[0])]
+            elif rgb_obs.ndim == 3:
+                # 单个图像 (H, W, 3)，可能是第一步
+                image_seq_list = [rgb_obs]
+                # 如果序列长度不足，重复第一帧
+                while len(image_seq_list) < obs_seq_len:
+                    image_seq_list.insert(0, image_seq_list[0])
+            else:
+                print(f"警告: 意外的 rgb 观测形状: {rgb_obs.shape}")
+                break
+            
+            # 确保序列长度为 obs_seq_len
+            if len(image_seq_list) > obs_seq_len:
+                image_seq_list = image_seq_list[-obs_seq_len:]
+            elif len(image_seq_list) < obs_seq_len:
+                # 如果不足，重复第一帧
+                while len(image_seq_list) < obs_seq_len:
+                    image_seq_list.insert(0, image_seq_list[0])
+            
+            # 准备图像序列（只归一化，不堆叠和 resize）
+            image_sequence = stack_image_sequence(
+                image_seq_list,
+                target_height=target_height,
+                target_width=target_width
+            )  # (seq_len, H_orig, W_orig, 3)
+            
+            # 转换为 PyTorch 张量（添加 batch 维度）
+            images_tensor = torch.from_numpy(image_sequence).float().unsqueeze(0).to(device)  # (1, seq_len, H_orig, W_orig, 3)
             
             # 推理动作（归一化空间）- 测量时间
             inference_start = time.perf_counter()
             action_norm = infer_action(
-                model, obs_seq, ula_sampler,
+                model, images_tensor, ula_sampler,
                 num_action_samples=num_action_samples,
+                optimize_again=True,  # 匹配 gin: IbcPolicy.optimize_again = True
+                again_noise_scale=1.0,  # 匹配 gin: IbcPolicy.inference_langevin_noise_scale = 1.0 (默认值)
+                again_step_size_init=1e-1,  # 匹配 gin: IbcPolicy.again_stepsize_init = 1e-1
+                again_step_size_final=1e-5,  # 匹配 gin: IbcPolicy.again_stepsize_final = 1e-5
                 device=device
             )
             inference_end = time.perf_counter()
@@ -650,7 +747,7 @@ def evaluate_policy(
                     # 反归一化动作到原始空间（用于标记）
                     action_orig_for_plot = denormalize_action(action_norm, norm_params)
                     energy_frame = plot_energy_landscape(
-                        model, obs_seq, norm_params, 
+                        model, images_tensor, norm_params, 
                         current_action=action_orig_for_plot,
                         device=device
                     )
@@ -900,7 +997,7 @@ if __name__ == '__main__':
     # 模型路径：自动查找最新的 checkpoint
     def find_default_model():
         """查找默认模型文件（优先 final_model.pth，否则选择最新的 checkpoint）"""
-        checkpoints_dir = IBC_ROOT / 'models' / 'pushing_states' / 'checkpoints'
+        checkpoints_dir = IBC_ROOT / 'models' / 'pushing_pixel' / 'checkpoints'
         
         # 优先查找 final_model.pth
         final_model = checkpoints_dir / 'final_model.pth'
@@ -918,7 +1015,7 @@ if __name__ == '__main__':
     model_path = find_default_model()
     if model_path is None:
         print("错误: 未找到模型文件")
-        checkpoints_dir = IBC_ROOT / 'models' / 'pushing_states' / 'checkpoints'
+        checkpoints_dir = IBC_ROOT / 'models' / 'pushing_pixel' / 'checkpoints'
         if checkpoints_dir.exists():
             model_files = list(checkpoints_dir.glob('*.pth'))
             if model_files:
@@ -927,17 +1024,17 @@ if __name__ == '__main__':
                     print(f"    {f}")
         sys.exit(1)
     
-    # 评估参数
-    num_episodes = 10
+    # 评估参数（匹配 gin 配置）
+    num_episodes = 10  # 匹配 gin: train_eval.eval_episodes = 20
     max_steps = 100
-    num_action_samples = 256
+    num_action_samples = 2048  # 匹配 gin: IbcPolicy.num_action_samples = 2048
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     shared_memory = False
     seed = None
     
     # 视频保存参数
     save_video = True
-    video_output_dir = IBC_ROOT / 'plots' / 'pushing_states'  # 视频输出目录
+    video_output_dir = IBC_ROOT / 'plots' / 'pushing_pixel'  # 视频输出目录
     video_episodes = num_episodes  # 保存所有 episodes 的视频（设置为 num_episodes 以保存全部）
     
     # 能量图景视频保存参数

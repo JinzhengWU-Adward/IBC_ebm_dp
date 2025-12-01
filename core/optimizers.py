@@ -389,18 +389,23 @@ class ULASampler:
         ebm: torch.nn.Module,
         num_samples: int,
         init_samples: Optional[torch.Tensor] = None,
-        return_trajectory: bool = False
+        return_trajectory: bool = False,
+        obs_encoding: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, Optional[List[torch.Tensor]]]:
         """
-        使用 ULA 从 EBM 中采样
+        使用 ULA 从 EBM 中采样（支持 Late Fusion）
         
         Args:
             x: 输入观测，形状为 (B, ...)
+               如果 obs_encoding 不为 None，此参数可忽略（Late Fusion 模式）
             ebm: 能量基模型
             num_samples: 每个输入采样的样本数
             init_samples: 初始样本，形状为 (B, num_samples, action_dim)
                          如果为None，则随机初始化
             return_trajectory: 是否返回采样轨迹
+            obs_encoding: 可选的预编码观测特征，形状为 (B, encoding_dim)
+                         如果提供，则使用 Late Fusion 模式（匹配 IBC 官方实现）
+                         如果为 None，则使用标准模式（ebm(x, samples)）
             
         Returns:
             samples: 采样结果，形状为 (B, num_samples, action_dim)
@@ -410,12 +415,17 @@ class ULASampler:
         was_training = ebm.training
         ebm.eval()
         
-        B = x.size(0)
+        B = x.size(0) if obs_encoding is None else obs_encoding.size(0)
         action_dim = self.bounds.shape[1]
         bounds_tensor = torch.as_tensor(
             self.bounds,
             dtype=torch.float32
         ).to(self.device)
+        
+        # Late Fusion: 如果提供了 obs_encoding，断开梯度（只优化 actions）
+        # 匹配 IBC: stop_chain_grad=True，在采样过程中不更新 obs_encoding 的梯度
+        if obs_encoding is not None:
+            obs_encoding = obs_encoding.detach()
         
         # 初始化样本
         if init_samples is None:
@@ -438,8 +448,15 @@ class ULASampler:
             # 这里我们直接计算当前 step 的 rate
             current_step_size = self._get_step_size(step)
 
-            # 计算能量
-            energies = ebm(x, samples)  # (B, num_samples)
+            # 计算能量（支持 Late Fusion）
+            if obs_encoding is not None:
+                # Late Fusion: 使用预编码的 obs_encoding
+                # obs_encoding: (B, encoding_dim)，需要扩展以匹配 samples: (B, num_samples, action_dim)
+                # 直接调用模型的 forward 方法，它会自动处理扩展
+                energies = ebm(images=None, actions=samples, obs_encoding=obs_encoding)  # (B, num_samples)
+            else:
+                # 标准模式：ebm(x, samples)
+                energies = ebm(x, samples)  # (B, num_samples)
             
             # 计算梯度
             grad = torch.autograd.grad(
