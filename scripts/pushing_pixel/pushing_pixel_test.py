@@ -991,10 +991,29 @@ if __name__ == '__main__':
     IBC_ROOT = Path(__file__).parent.parent.parent
     
     # ============================================
-    # 配置参数（显式设置，不使用命令行参数）
+    # 配置参数（硬编码在代码中，直接修改下面的变量即可）
     # ============================================
     
-    # 模型路径：自动查找最新的 checkpoint
+    # ===== 模型选择配置 =====
+    # 方式1: 通过训练步数指定模型（推荐，例如: 15000 会查找 checkpoint_015000.pth）
+    #       设置为 None 则使用其他方式
+    CHECKPOINT_STEP = 5000  # 例如: 15000, 20000, 50000, None
+    
+    # 方式2: 直接指定模型文件路径（相对于 IBC_ebm_dp 根目录或绝对路径）
+    #       设置为 None 则使用其他方式
+    MODEL_PATH = None  # 例如: 'models/pushing_pixel/checkpoints/checkpoint_015000.pth'
+    
+    # 方式3: 如果上面两个都是 None，则自动查找最新的 checkpoint 或 final_model.pth
+    
+    # ===== 辅助函数 =====
+    def find_model_by_step(step: int):
+        """通过步数查找模型文件"""
+        checkpoints_dir = IBC_ROOT / 'models' / 'pushing_pixel' / 'checkpoints'
+        checkpoint_path = checkpoints_dir / f'checkpoint_{step:06d}.pth'
+        if checkpoint_path.exists():
+            return checkpoint_path
+        return None
+    
     def find_default_model():
         """查找默认模型文件（优先 final_model.pth，否则选择最新的 checkpoint）"""
         checkpoints_dir = IBC_ROOT / 'models' / 'pushing_pixel' / 'checkpoints'
@@ -1012,20 +1031,51 @@ if __name__ == '__main__':
         
         return None
     
-    model_path = find_default_model()
-    if model_path is None:
-        print("错误: 未找到模型文件")
-        checkpoints_dir = IBC_ROOT / 'models' / 'pushing_pixel' / 'checkpoints'
-        if checkpoints_dir.exists():
-            model_files = list(checkpoints_dir.glob('*.pth'))
-            if model_files:
-                print(f"  找到以下模型文件:")
-                for f in sorted(model_files):
-                    print(f"    {f}")
-        sys.exit(1)
+    # ===== 确定模型路径 =====
+    if CHECKPOINT_STEP is not None:
+        # 方式1: 通过步数指定
+        model_path = find_model_by_step(CHECKPOINT_STEP)
+        if model_path is None:
+            print(f"错误: 未找到步数为 {CHECKPOINT_STEP} 的模型文件")
+            checkpoints_dir = IBC_ROOT / 'models' / 'pushing_pixel' / 'checkpoints'
+            if checkpoints_dir.exists():
+                checkpoint_files = sorted(checkpoints_dir.glob('checkpoint_*.pth'))
+                if checkpoint_files:
+                    print(f"  可用的 checkpoint 文件:")
+                    for f in checkpoint_files:
+                        # 尝试从文件名提取步数
+                        try:
+                            step_str = f.stem.split('_')[1]
+                            step = int(step_str)
+                            print(f"    {f.name} (步数: {step})")
+                        except:
+                            print(f"    {f.name}")
+            sys.exit(1)
+    elif MODEL_PATH is not None:
+        # 方式2: 直接指定路径
+        model_path = Path(MODEL_PATH)
+        if not model_path.is_absolute():
+            # 相对路径，尝试相对于 IBC_ROOT
+            model_path = IBC_ROOT / model_path
+        if not model_path.exists():
+            print(f"错误: 模型文件不存在: {model_path}")
+            sys.exit(1)
+    else:
+        # 方式3: 使用默认查找逻辑
+        model_path = find_default_model()
+        if model_path is None:
+            print("错误: 未找到模型文件")
+            checkpoints_dir = IBC_ROOT / 'models' / 'pushing_pixel' / 'checkpoints'
+            if checkpoints_dir.exists():
+                model_files = list(checkpoints_dir.glob('*.pth'))
+                if model_files:
+                    print(f"  找到以下模型文件:")
+                    for f in sorted(model_files):
+                        print(f"    {f}")
+            sys.exit(1)
     
     # 评估参数（匹配 gin 配置）
-    num_episodes = 10  # 匹配 gin: train_eval.eval_episodes = 20
+    num_episodes = 100  # 匹配 gin: train_eval.eval_episodes = 20
     max_steps = 100
     num_action_samples = 2048  # 匹配 gin: IbcPolicy.num_action_samples = 2048
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -1033,12 +1083,12 @@ if __name__ == '__main__':
     seed = None
     
     # 视频保存参数
-    save_video = True
+    save_video = False
     video_output_dir = IBC_ROOT / 'plots' / 'pushing_pixel'  # 视频输出目录
     video_episodes = num_episodes  # 保存所有 episodes 的视频（设置为 num_episodes 以保存全部）
     
     # 能量图景视频保存参数
-    save_energy_landscape = True  # 是否保存能量图景视频
+    save_energy_landscape = False  # 是否保存能量图景视频
     energy_episodes = num_episodes  # 保存所有 episodes 的能量图景（设置为 num_episodes 以保存全部）
     
     # ============================================

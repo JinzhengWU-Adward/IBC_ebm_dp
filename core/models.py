@@ -860,8 +860,9 @@ class PixelEBM(nn.Module):
         
         # ⚠️ 关键修复：匹配 IBC 官方的 image_prepro.preprocess 流程
         # 1. 堆叠图像序列在通道维度（匹配 IBC: stack_images_channelwise）
-        # (B, seq_len, H, W, 3) -> (B, H, W, 3*seq_len)
-        images = images.permute(0, 2, 3, 1, 4)  # (B, H, W, seq_len, 3)
+        # TensorFlow 的 tf.reshape 是直接 reshape，不 permute
+        # 从 (B, seq_len, H, W, C) 直接 reshape 为 (B, H, W, C*seq_len)
+        # 这与 permute + reshape 的结果不同！
         images = images.reshape(B, H, W, seq_len * C)  # (B, H, W, 3*seq_len)
         
         # 2. 转换为 NCHW 格式以便使用 F.interpolate
