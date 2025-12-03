@@ -827,6 +827,7 @@ class PixelEBM(nn.Module):
         
         self.target_height = target_height
         self.target_width = target_width
+        self.action_dim = action_dim  # 保存动作维度，供测试代码使用
         
         # Encoder: 将图像编码为特征向量
         self.encoder = ConvMaxpoolEncoder(in_channels=image_channels)

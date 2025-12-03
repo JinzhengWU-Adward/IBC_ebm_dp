@@ -37,15 +37,15 @@ MODEL_BASE_DIR = '/tmp/ibc_logs/mlp_ebm'  # IBC 训练输出的基础目录
 CHECKPOINT_STEP = None  # 检查点步数（如果为 None，则使用最新的检查点）
 
 # 评估参数（匹配 gin 配置）
-NUM_EPISODES = 20  # 评估回合数（匹配 gin: train_eval.eval_episodes = 20）
-MAX_STEPS = 150  # 每回合最大步数
+NUM_EPISODES = 100  # 评估回合数（匹配 gin: train_eval.eval_episodes = 20）
+MAX_STEPS = 100  # 每回合最大步数
 SEQUENCE_LENGTH = 2  # 观测序列长度（匹配 gin: train_eval.sequence_length = 2）
 GOAL_TOLERANCE = 0.02  # 目标容差（匹配 gin: train_eval.goal_tolerance = 0.02）
 
 # 其他参数
 SHARED_MEMORY = False  # 是否使用共享内存
 SAVE_VIDEO = False  # 是否保存视频
-SEED = 0  # 随机种子（匹配 gin: train_eval.seed = 0）
+SEED = None  # 随机种子（匹配 gin: train_eval.seed = 0）
 
 # ============================================================================
 

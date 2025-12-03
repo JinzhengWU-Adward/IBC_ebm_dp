@@ -997,7 +997,7 @@ if __name__ == '__main__':
     # ===== 模型选择配置 =====
     # 方式1: 通过训练步数指定模型（推荐，例如: 15000 会查找 checkpoint_015000.pth）
     #       设置为 None 则使用其他方式
-    CHECKPOINT_STEP = 5000  # 例如: 15000, 20000, 50000, None
+    CHECKPOINT_STEP = 15000  # 例如: 15000, 20000, 50000, None
     
     # 方式2: 直接指定模型文件路径（相对于 IBC_ebm_dp 根目录或绝对路径）
     #       设置为 None 则使用其他方式
@@ -1080,7 +1080,7 @@ if __name__ == '__main__':
     num_action_samples = 2048  # 匹配 gin: IbcPolicy.num_action_samples = 2048
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     shared_memory = False
-    seed = None
+    seed = 0
     
     # 视频保存参数
     save_video = False
